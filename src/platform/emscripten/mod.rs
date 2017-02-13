@@ -15,13 +15,13 @@ gen_api_transition!();
 #[derive(Clone, Default)]
 pub struct PlatformSpecificWindowBuilderAttributes;
 
-pub struct Window;
-
+#[derive(Clone)]
 pub struct WindowProxy;
 
 impl WindowProxy {
     #[inline]
     pub fn wakeup_event_loop(&self) {
+        unimplemented!()
     }
 }
 
@@ -84,9 +84,10 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
     }
 }
 
-
+pub struct Window;
 
 impl Window {
+    #[inline]
     pub fn new(_: &WindowAttributes,
                _: &PlatformSpecificWindowBuilderAttributes)
                 -> Result<Window, CreationError> {
