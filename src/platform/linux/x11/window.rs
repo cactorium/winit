@@ -1,14 +1,11 @@
-use {WindowEvent as Event, MouseCursor};
+use MouseCursor;
 use CreationError;
 use CreationError::OsError;
 use libc;
 use std::borrow::Borrow;
 use std::{mem, ptr, cmp};
-use std::cell::Cell;
-use std::sync::atomic::AtomicBool;
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::os::raw::c_long;
+use std::os::raw::{c_int, c_long, c_uchar};
 use std::thread;
 use std::time::Duration;
 
@@ -18,14 +15,8 @@ use platform::PlatformSpecificWindowBuilderAttributes;
 
 use platform::MonitorId as PlatformMonitorId;
 
-use super::input::XInputEventHandler;
 use super::{ffi};
-use super::{MonitorId, XConnection};
-
-// XOpenIM doesn't seem to be thread-safe
-lazy_static! {      // TODO: use a static mutex when that's possible, and put me back in my function
-    static ref GLOBAL_XOPENIM_LOCK: Mutex<()> = Mutex::new(());
-}
+use super::{MonitorId, XConnection, WindowId, EventsLoop};
 
 // TODO: remove me
 fn with_c_str<F, T>(s: &str, f: F) -> T where F: FnOnce(*const libc::c_char) -> T {
@@ -47,8 +38,6 @@ pub struct XWindow {
     is_fullscreen: bool,
     screen_id: libc::c_int,
     xf86_desk_mode: Option<ffi::XF86VidModeModeInfo>,
-    ic: ffi::XIC,
-    im: ffi::XIM,
     window_proxy_data: Arc<Mutex<Option<WindowProxyData>>>,
 }
 
@@ -65,8 +54,6 @@ impl Drop for XWindow {
             // are no longer able to send messages to this window.
             *self.window_proxy_data.lock().unwrap() = None;
 
-            let _lock = GLOBAL_XOPENIM_LOCK.lock().unwrap();
-
             if self.is_fullscreen {
                 if let Some(mut xf86_desk_mode) = self.xf86_desk_mode {
                     (self.display.xf86vmode.XF86VidModeSwitchToMode)(self.display.display, self.screen_id, &mut xf86_desk_mode);
@@ -74,8 +61,6 @@ impl Drop for XWindow {
                 (self.display.xf86vmode.XF86VidModeSetViewPort)(self.display.display, self.screen_id, 0, 0);
             }
 
-            (self.display.xlib.XDestroyIC)(self.ic);
-            (self.display.xlib.XCloseIM)(self.im);
             (self.display.xlib.XDestroyWindow)(self.display.display, self.window);
         }
     }
@@ -111,182 +96,17 @@ impl WindowProxy {
     }
 }
 
-// XEvents of type GenericEvent store their actual data
-// in an XGenericEventCookie data structure. This is a wrapper
-// to extract the cookie from a GenericEvent XEvent and release
-// the cookie data once it has been processed
-struct GenericEventCookie<'a> {
-    display: &'a XConnection,
-    cookie: ffi::XGenericEventCookie
-}
-
-impl<'a> GenericEventCookie<'a> {
-    fn from_event<'b>(display: &'b XConnection, event: ffi::XEvent) -> Option<GenericEventCookie<'b>> {
-        unsafe {
-            let mut cookie: ffi::XGenericEventCookie = From::from(event);
-            if (display.xlib.XGetEventData)(display.display, &mut cookie) == ffi::True {
-                Some(GenericEventCookie{display: display, cookie: cookie})
-            } else {
-                None
-            }
-        }
-    }
-}
-
-impl<'a> Drop for GenericEventCookie<'a> {
-    fn drop(&mut self) {
-        unsafe {
-            let xlib = &self.display.xlib;
-            (xlib.XFreeEventData)(self.display.display, &mut self.cookie);
-        }
-    }
-}
-
-pub struct PollEventsIterator<'a> {
-    window: &'a Window
-}
-
-impl<'a> Iterator for PollEventsIterator<'a> {
-    type Item = Event;
-
-    fn next(&mut self) -> Option<Event> {
-        let xlib = &self.window.x.display.xlib;
-
-        loop {
-            if let Some(ev) = self.window.pending_events.lock().unwrap().pop_front() {
-                return Some(ev);
-            }
-
-            let mut xev = unsafe { mem::uninitialized() };
-            let res = unsafe { (xlib.XCheckMaskEvent)(self.window.x.display.display, -1, &mut xev) };
-
-            if res == 0 {
-                let res = unsafe { (xlib.XCheckTypedEvent)(self.window.x.display.display, ffi::ClientMessage, &mut xev) };
-
-                if res == 0 {
-                    let res = unsafe { (xlib.XCheckTypedEvent)(self.window.x.display.display, ffi::GenericEvent, &mut xev) };
-                    if res == 0 {
-                        return None;
-                    }
-                }
-            }
-
-            match xev.get_type() {
-                ffi::MappingNotify => {
-                    unsafe { (xlib.XRefreshKeyboardMapping)(mem::transmute(&xev)); }
-                    self.window.x.display.check_errors().expect("Failed to call XRefreshKeyboardMapping");
-                },
-
-                ffi::ClientMessage => {
-                    use events::WindowEvent::{Closed, Awakened};
-                    use std::sync::atomic::Ordering::Relaxed;
-
-                    let client_msg: &ffi::XClientMessageEvent = unsafe { mem::transmute(&xev) };
-
-                    if client_msg.data.get_long(0) == self.window.wm_delete_window as libc::c_long {
-                        self.window.is_closed.store(true, Relaxed);
-                        return Some(Closed);
-                    } else {
-                        return Some(Awakened);
-                    }
-                },
-
-                ffi::ConfigureNotify => {
-                    use events::WindowEvent::Resized;
-                    let cfg_event: &ffi::XConfigureEvent = unsafe { mem::transmute(&xev) };
-                    let (current_width, current_height) = self.window.current_size.get();
-                    if current_width != cfg_event.width || current_height != cfg_event.height {
-                        self.window.current_size.set((cfg_event.width, cfg_event.height));
-                        return Some(Resized(cfg_event.width as u32, cfg_event.height as u32));
-                    }
-                },
-
-                ffi::Expose => {
-                    use events::WindowEvent::Refresh;
-                    return Some(Refresh);
-                },
-
-                ffi::KeyPress | ffi::KeyRelease => {
-                    let mut event: &mut ffi::XKeyEvent = unsafe { mem::transmute(&mut xev) };
-                    let events = self.window.input_handler.lock().unwrap().translate_key_event(&mut event);
-                    for event in events {
-                        self.window.pending_events.lock().unwrap().push_back(event);
-                    }
-                },
-
-                ffi::GenericEvent => {
-                    if let Some(cookie) = GenericEventCookie::from_event(self.window.x.display.borrow(), xev) {
-                        match cookie.cookie.evtype {
-                            ffi::XI_DeviceChanged...ffi::XI_LASTEVENT => {
-                                match self.window.input_handler.lock() {
-                                    Ok(mut handler) => {
-                                        match handler.translate_event(&cookie.cookie) {
-                                            Some(event) => self.window.pending_events.lock().unwrap().push_back(event),
-                                            None => {}
-                                        }
-                                    },
-                                    Err(_) => {}
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-
-                _ => {}
-            };
-        }
-    }
-}
-
-pub struct WaitEventsIterator<'a> {
-    window: &'a Window,
-}
-
-impl<'a> Iterator for WaitEventsIterator<'a> {
-    type Item = Event;
-
-    fn next(&mut self) -> Option<Event> {
-        use std::sync::atomic::Ordering::Relaxed;
-        use std::mem;
-
-        while !self.window.is_closed.load(Relaxed) {
-            if let Some(ev) = self.window.pending_events.lock().unwrap().pop_front() {
-                return Some(ev);
-            }
-
-            // this will block until an event arrives, but doesn't remove
-            // it from the queue
-            let mut xev = unsafe { mem::uninitialized() };
-            unsafe { (self.window.x.display.xlib.XPeekEvent)(self.window.x.display.display, &mut xev) };
-            self.window.x.display.check_errors().expect("Failed to call XPeekEvent");
-
-            // calling poll_events()
-            if let Some(ev) = self.window.poll_events().next() {
-                return Some(ev);
-            }
-        }
-
-        None
-    }
-}
-
 pub struct Window {
     pub x: Arc<XWindow>,
-    is_closed: AtomicBool,
-    wm_delete_window: ffi::Atom,
-    current_size: Cell<(libc::c_int, libc::c_int)>,
-    /// Events that have been retreived with XLib but not dispatched with iterators yet
-    pending_events: Mutex<VecDeque<Event>>,
     cursor_state: Mutex<CursorState>,
-    input_handler: Mutex<XInputEventHandler>
 }
 
 impl Window {
-    pub fn new(display: &Arc<XConnection>, window_attrs: &WindowAttributes,
+    pub fn new(ctx: &EventsLoop, window_attrs: &WindowAttributes,
                pl_attribs: &PlatformSpecificWindowBuilderAttributes)
                -> Result<Window, CreationError>
     {
+        let display = &ctx.display;
         let dimensions = {
 
             // x11 only applies constraints when the window is actively resized
@@ -346,8 +166,7 @@ impl Window {
         };
 
         // getting the root window
-        let root = unsafe { (display.xlib.XDefaultRootWindow)(display.display) };
-        display.check_errors().expect("Failed to get root window");
+        let root = ctx.root;
 
         // creating
         let mut set_win_attr = {
@@ -395,6 +214,19 @@ impl Window {
             win
         };
 
+        // Set ICCCM WM_CLASS property based on initial window title
+        // Must be done *before* mapping the window by ICCCM 4.1.2.5
+        unsafe {
+            with_c_str(&*window_attrs.title, |c_name| {
+                let hint = (display.xlib.XAllocClassHint)();
+                (*hint).res_name = c_name as *mut libc::c_char;
+                (*hint).res_class = c_name as *mut libc::c_char;
+                (display.xlib.XSetClassHint)(display.display, window, hint);
+                display.check_errors().expect("Failed to call XSetClassHint");
+                (display.xlib.XFree)(hint as *mut _);
+            });
+        }
+
         // set visibility
         if window_attrs.visible {
             unsafe {
@@ -405,49 +237,13 @@ impl Window {
             display.check_errors().expect("Failed to set window visibility");
         }
 
-        // creating window, step 2
-        let wm_delete_window = unsafe {
-            let mut wm_delete_window = with_c_str("WM_DELETE_WINDOW", |delete_window|
-                (display.xlib.XInternAtom)(display.display, delete_window, 0)
-            );
-            display.check_errors().expect("Failed to call XInternAtom");
-            (display.xlib.XSetWMProtocols)(display.display, window, &mut wm_delete_window, 1);
+        // Opt into handling window close
+        unsafe {
+            (display.xlib.XSetWMProtocols)(display.display, window, &ctx.wm_delete_window as *const _ as *mut _, 1);
             display.check_errors().expect("Failed to call XSetWMProtocols");
             (display.xlib.XFlush)(display.display);
             display.check_errors().expect("Failed to call XFlush");
-
-            wm_delete_window
-        };
-
-        // creating IM
-        let im = unsafe {
-            let _lock = GLOBAL_XOPENIM_LOCK.lock().unwrap();
-
-            let im = (display.xlib.XOpenIM)(display.display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-            if im.is_null() {
-                return Err(OsError(format!("XOpenIM failed")));
-            }
-            im
-        };
-
-        // creating input context
-        let ic = unsafe {
-            let ic = with_c_str("inputStyle", |input_style|
-                with_c_str("clientWindow", |client_window|
-                    (display.xlib.XCreateIC)(
-                        im, input_style,
-                        ffi::XIMPreeditNothing | ffi::XIMStatusNothing, client_window,
-                        window, ptr::null::<()>()
-                    )
-                )
-            );
-            if ic.is_null() {
-                return Err(OsError(format!("XCreateIC failed")));
-            }
-            (display.xlib.XSetICFocus)(ic);
-            display.check_errors().expect("Failed to call XSetICFocus");
-            ic
-        };
+        }
 
         // Attempt to make keyboard input repeat detectable
         unsafe {
@@ -456,18 +252,6 @@ impl Window {
             if supported_ptr == ffi::False {
                 return Err(OsError(format!("XkbSetDetectableAutoRepeat failed")));
             }
-        }
-
-        // Set ICCCM WM_CLASS property based on initial window title
-        unsafe {
-            with_c_str(&*window_attrs.title, |c_name| {
-                let hint = (display.xlib.XAllocClassHint)();
-                (*hint).res_name = c_name as *mut libc::c_char;
-                (*hint).res_class = c_name as *mut libc::c_char;
-                (display.xlib.XSetClassHint)(display.display, window, hint);
-                display.check_errors().expect("Failed to call XSetClassHint");
-                (display.xlib.XFree)(hint as *mut _);
-            });
         }
 
         let is_fullscreen = window_attrs.monitor.is_some();
@@ -561,6 +345,25 @@ impl Window {
 
         }
 
+        // Select XInput2 events
+        {
+            let mask = ffi::XI_MotionMask
+                | ffi::XI_ButtonPressMask | ffi::XI_ButtonReleaseMask
+                // | ffi::XI_KeyPressMask | ffi::XI_KeyReleaseMask
+                | ffi::XI_EnterMask | ffi::XI_LeaveMask
+                | ffi::XI_FocusInMask | ffi::XI_FocusOutMask
+                | if window_attrs.multitouch { ffi::XI_TouchBeginMask | ffi::XI_TouchUpdateMask | ffi::XI_TouchEndMask } else { 0 };
+            unsafe {
+                let mut event_mask = ffi::XIEventMask{
+                    deviceid: ffi::XIAllMasterDevices,
+                    mask: mem::transmute::<*const i32, *mut c_uchar>(&mask as *const i32),
+                    mask_len: mem::size_of_val(&mask) as c_int,
+                };
+                (display.xinput2.XISelectEvents)(display.display, window,
+                                                 &mut event_mask as *mut ffi::XIEventMask, 1);
+            };
+        }
+
         // creating the window object
         let window_proxy_data = WindowProxyData {
             display: display.clone(),
@@ -572,22 +375,16 @@ impl Window {
             x: Arc::new(XWindow {
                 display: display.clone(),
                 window: window,
-                im: im,
-                ic: ic,
                 screen_id: screen_id,
                 is_fullscreen: is_fullscreen,
                 xf86_desk_mode: xf86_desk_mode,
                 window_proxy_data: window_proxy_data,
             }),
-            is_closed: AtomicBool::new(false),
-            wm_delete_window: wm_delete_window,
-            current_size: Cell::new((0, 0)),
-            pending_events: Mutex::new(VecDeque::new()),
             cursor_state: Mutex::new(CursorState::Normal),
-            input_handler: Mutex::new(XInputEventHandler::new(display, window, ic, window_attrs))
         };
 
         window.set_title(&window_attrs.title);
+        window.set_decorations(window_attrs.decorations);
 
         if window_attrs.visible {
             unsafe {
@@ -643,6 +440,48 @@ impl Window {
         });
         self.x.display.check_errors().expect("Failed to set window title");
 
+    }
+
+    pub fn set_decorations(&self, decorations: bool) {
+        #[repr(C)]
+        struct MotifWindowHints {
+            flags: u32,
+            functions: u32,
+            decorations: u32,
+            input_mode: i32,
+            status: u32,
+        }
+
+        let wm_hints = unsafe {
+            (self.x.display.xlib.XInternAtom)(self.x.display.display, b"_MOTIF_WM_HINTS\0".as_ptr() as *const _, 0)
+        };
+        self.x.display.check_errors().expect("Failed to call XInternAtom");
+
+        if !decorations {
+            let hints = MotifWindowHints {
+                flags: 2, // MWM_HINTS_DECORATIONS
+                functions: 0,
+                decorations: 0,
+                input_mode: 0,
+                status: 0,
+            };
+
+            unsafe {
+                (self.x.display.xlib.XChangeProperty)(
+                    self.x.display.display, self.x.window,
+                    wm_hints, wm_hints, 32 /* Size of elements in struct */,
+                    ffi::PropModeReplace, &hints as *const MotifWindowHints as *const u8,
+                    5 /* Number of elements in struct */);
+                (self.x.display.xlib.XFlush)(self.x.display.display);
+            }
+        } else {
+            unsafe {
+                (self.x.display.xlib.XDeleteProperty)(self.x.display.display, self.x.window, wm_hints);
+                (self.x.display.xlib.XFlush)(self.x.display.display);
+            }
+        }
+
+        self.x.display.check_errors().expect("Failed to set decorations");
     }
 
     pub fn show(&self) {
@@ -718,20 +557,6 @@ impl Window {
     }
 
     #[inline]
-    pub fn poll_events(&self) -> PollEventsIterator {
-        PollEventsIterator {
-            window: self
-        }
-    }
-
-    #[inline]
-    pub fn wait_events(&self) -> WaitEventsIterator {
-        WaitEventsIterator {
-            window: self
-        }
-    }
-
-    #[inline]
     pub fn get_xlib_display(&self) -> *mut libc::c_void {
         self.x.display.display as *mut libc::c_void
     }
@@ -785,7 +610,7 @@ impl Window {
             // differs on the desktop environments or themes.
             //
             // Try the better looking (or more suiting) names first.
-            let mut xcursor = match cursor {
+            let xcursor = match cursor {
                 MouseCursor::Alias => load("link"),
                 MouseCursor::Arrow => load("arrow"),
                 MouseCursor::Cell => load("plus"),
@@ -948,9 +773,15 @@ impl Window {
         }
     }
 
-    #[inline]
     pub fn hidpi_factor(&self) -> f32 {
-        1.0
+        unsafe {
+            let x_px = (self.x.display.xlib.XDisplayWidth)(self.x.display.display, self.x.screen_id);
+            let y_px = (self.x.display.xlib.XDisplayHeight)(self.x.display.display, self.x.screen_id);
+            let x_mm = (self.x.display.xlib.XDisplayWidthMM)(self.x.display.display, self.x.screen_id);
+            let y_mm = (self.x.display.xlib.XDisplayHeightMM)(self.x.display.display, self.x.screen_id);
+            let ppmm = ((x_px as f32 * y_px as f32) / (x_mm as f32 * y_mm as f32)).sqrt();
+            ((ppmm * (12.0 * 25.4 / 96.0)).round() / 12.0).max(1.0) // quantize with 1/12 step size.
+        }
     }
 
     pub fn set_cursor_position(&self, x: i32, y: i32) -> Result<(), ()> {
@@ -959,4 +790,7 @@ impl Window {
             self.x.display.check_errors().map_err(|_| ())
         }
     }
+
+    #[inline]
+    pub fn id(&self) -> WindowId { WindowId(self.x.window) }
 }

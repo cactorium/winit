@@ -4,16 +4,13 @@ use std::sync::Arc;
 use std::ptr;
 use libc;
 use Window;
-use platform::Window as LinuxWindow;
+use platform::Window2 as LinuxWindow;
 use platform::{UnixBackend, UNIX_BACKEND};
 use WindowBuilder;
-use api::x11::XConnection;
-use api::x11::ffi::XVisualInfo;
+use platform::x11::XConnection;
+use platform::x11::ffi::XVisualInfo;
 
-use wayland_client::protocol::wl_display::WlDisplay;
-use wayland_client::protocol::wl_surface::WlSurface;
-
-pub use api::x11;
+pub use platform::x11;
 
 // TODO: do not expose XConnection
 pub fn get_x11_xconnection() -> Option<Arc<XConnection>> {
@@ -63,30 +60,12 @@ pub trait WindowExt {
     ///
     /// The pointer will become invalid when the glutin `Window` is destroyed.
     fn get_wayland_display(&self) -> Option<*mut libc::c_void>;
-
-    /// Returns a reference to the `WlSurface` object of wayland that is used by this window.
-    ///
-    /// For use with the `wayland-client` crate.
-    ///
-    /// **This function is not part of winit's public API.**
-    ///
-    /// Returns `None` if the window doesn't use wayland (if it uses xlib for example).
-    fn get_wayland_client_surface(&self) -> Option<&WlSurface>;
-
-    /// Returns a pointer to the `WlDisplay` object of wayland that is used by this window.
-    ///
-    /// For use with the `wayland-client` crate.
-    ///
-    /// **This function is not part of winit's public API.**
-    ///
-    /// Returns `None` if the window doesn't use wayland (if it uses xlib for example).
-    fn get_wayland_client_display(&self) -> Option<&WlDisplay>;
 }
 
 impl WindowExt for Window {
     #[inline]
     fn get_xlib_window(&self) -> Option<*mut libc::c_void> {
-        match *self.window.window {
+        match self.window {
             LinuxWindow::X(ref w) => Some(w.get_xlib_window()),
             _ => None
         }
@@ -94,28 +73,28 @@ impl WindowExt for Window {
 
     #[inline]
     fn get_xlib_display(&self) -> Option<*mut libc::c_void> {
-        match *self.window.window {
+        match self.window {
             LinuxWindow::X(ref w) => Some(w.get_xlib_display()),
             _ => None
         }
     }
 
     fn get_xlib_screen_id(&self) -> Option<*mut libc::c_void> {
-        match *self.window.window {
+        match self.window {
             LinuxWindow::X(ref w) => Some(w.get_xlib_screen_id()),
             _ => None
         }
     }
 
     fn get_xlib_xconnection(&self) -> Option<Arc<XConnection>> {
-        match *self.window.window {
+        match self.window {
             LinuxWindow::X(ref w) => Some(w.get_xlib_xconnection()),
             _ => None
         }
     }
 
     fn get_xcb_connection(&self) -> Option<*mut libc::c_void> {
-        match *self.window.window {
+        match self.window {
             LinuxWindow::X(ref w) => Some(w.get_xcb_connection()),
             _ => None
         }
@@ -124,28 +103,17 @@ impl WindowExt for Window {
     #[inline]
     fn get_wayland_surface(&self) -> Option<*mut libc::c_void> {
         use wayland_client::Proxy;
-        self.get_wayland_client_surface().map(|p| p.ptr() as *mut _)
-    }
-
-
-    #[inline]
-    fn get_wayland_display(&self) -> Option<*mut libc::c_void> {
-        use wayland_client::Proxy;
-        self.get_wayland_client_display().map(|p| p.ptr() as *mut _)
-    }
-
-    #[inline]
-    fn get_wayland_client_surface(&self) -> Option<&WlSurface> {
-        match *self.window.window {
-            LinuxWindow::Wayland(ref w) => Some(w.get_surface()),
+        match self.window {
+            LinuxWindow::Wayland(ref w) => Some(w.get_surface().ptr() as *mut _),
             _ => None
         }
     }
 
     #[inline]
-    fn get_wayland_client_display(&self) -> Option<&WlDisplay> {
-        match *self.window.window {
-            LinuxWindow::Wayland(ref w) => Some(w.get_display()),
+    fn get_wayland_display(&self) -> Option<*mut libc::c_void> {
+        use wayland_client::Proxy;
+        match self.window {
+            LinuxWindow::Wayland(ref w) => Some(w.get_display().ptr() as *mut _),
             _ => None
         }
     }

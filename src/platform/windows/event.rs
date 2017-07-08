@@ -1,15 +1,35 @@
 use events::VirtualKeyCode;
+use events::ModifiersState;
 use winapi;
 use user32;
 use ScanCode;
 
 const MAPVK_VSC_TO_VK_EX: u32 = 3;
 
+pub fn get_key_mods() -> ModifiersState {
+    let mut mods = ModifiersState::default();
+    unsafe {
+        if user32::GetKeyState(winapi::VK_SHIFT) & (1 << 15) == (1 << 15) {
+            mods.shift = true;
+        }
+        if user32::GetKeyState(winapi::VK_CONTROL) & (1 << 15) == (1 << 15) {
+            mods.ctrl = true;
+        }
+        if user32::GetKeyState(winapi::VK_MENU) & (1 << 15) == (1 << 15) {
+            mods.alt = true;
+        }
+        if (user32::GetKeyState(winapi::VK_LWIN) | user32::GetKeyState(winapi::VK_RWIN)) & (1 << 15) == (1 << 15) {
+            mods.logo = true;
+        }
+    }
+    mods
+}
+
 pub fn vkeycode_to_element(wparam: winapi::WPARAM, lparam: winapi::LPARAM) -> (ScanCode, Option<VirtualKeyCode>) {
-    let scancode = ((lparam >> 16) & 0xff) as u8;
+    let scancode = ((lparam >> 16) & 0xff) as u32;
     let extended = (lparam & 0x01000000) != 0;
     let vk = match wparam as i32 {
-        winapi::VK_SHIFT => unsafe { user32::MapVirtualKeyA(scancode as u32, MAPVK_VSC_TO_VK_EX) as i32 },
+        winapi::VK_SHIFT => unsafe { user32::MapVirtualKeyA(scancode, MAPVK_VSC_TO_VK_EX) as i32 },
         winapi::VK_CONTROL => if extended { winapi::VK_RCONTROL } else { winapi::VK_LCONTROL },
         winapi::VK_MENU => if extended { winapi::VK_RMENU } else { winapi::VK_LMENU },
         other => other
